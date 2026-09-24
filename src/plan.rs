@@ -178,6 +178,11 @@ impl Plan {
                 "NDR" => {
                     let kid: usize = num(it.next(), line)?;
                     let dim = num(it.next(), line)?;
+                    // The replayer hands clEnqueueNDRangeKernel three-element
+                    // arrays, so a larger dim would read past them.
+                    if !(1..=3).contains(&dim) {
+                        return Err(format!("launch with {dim} dimensions: {line}"));
+                    }
                     let global = triple(&mut it, line)?;
                     let local = triple(&mut it, line)?;
                     let offset = triple(&mut it, line)?;
@@ -279,6 +284,8 @@ NDR 4 3 16 1 1 16 1 1 0 0 0 4
         assert!(Plan::parse(&SAMPLE.replace(" V 4 00 00 80 3f", " V 4 00 00")).is_err());
         assert!(Plan::parse(&SAMPLE.replace(" N\n", " M 3\n")).is_err());
         assert!(Plan::parse(&SAMPLE.replace(" N\n", "")).is_err());
+        assert!(Plan::parse(&SAMPLE.replace("NDR 4 3 ", "NDR 4 4 ")).is_err());
+        assert!(Plan::parse(&SAMPLE.replace("NDR 4 3 ", "NDR 4 0 ")).is_err());
     }
 
     #[test]
