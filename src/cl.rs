@@ -269,6 +269,85 @@ impl Context {
     }
 }
 
+impl Context {
+    /// A second in-order queue on this context with profiling enabled, for
+    /// timing launches; the main queue stays unprofiled.
+    pub fn profiling_queue(&self) -> Result<ProfilingQueue, ClError> {
+        let props: [sys::cl_queue_properties; 3] =
+            [sys::cl_queue_properties::from(sys::CL_QUEUE_PROPERTIES), sys::CL_QUEUE_PROFILING_ENABLE, 0];
+        let mut err = 0;
+        // SAFETY: valid context and device; zero-terminated property list.
+        let queue = unsafe { sys::clCreateCommandQueueWithProperties(self.ctx, self.device, props.as_ptr(), &raw mut err) };
+        check("clCreateCommandQueueWithProperties", err)?;
+        Ok(ProfilingQueue(queue))
+    }
+}
+
+/// An in-order queue with profiling, released on drop.
+pub struct ProfilingQueue(sys::cl_command_queue);
+
+impl ProfilingQueue {
+    /// Enqueue every launch, wait for all of them, and return each one's GPU
+    /// execution time, in order. Nothing waits between launches, so the GPU
+    /// runs them back to back as it would unprofiled.
+    pub fn time<'k>(
+        &self,
+        launches: impl IntoIterator<Item = (&'k Kernel, u32, &'k [usize; 3], &'k [usize; 3], &'k [usize; 3])>,
+    ) -> Result<Vec<std::time::Duration>, ClError> {
+        let mut events = Events(Vec::new());
+        for (kernel, dim, global, local, offset) in launches {
+            let local_ptr = if local[0] == 0 { ptr::null() } else { local.as_ptr() };
+            let mut event: sys::cl_event = ptr::null_mut();
+            // SAFETY: valid kernel and queue; the arrays hold `dim` values;
+            // the event is owned by `events` from here on.
+            check("clEnqueueNDRangeKernel", unsafe {
+                sys::clEnqueueNDRangeKernel(self.0, kernel.0, dim, offset.as_ptr(), global.as_ptr(), local_ptr, 0,
+                    ptr::null(), &raw mut event)
+            })?;
+            events.0.push(event);
+        }
+        // SAFETY: valid queue.
+        check("clFinish", unsafe { sys::clFinish(self.0) })?;
+        let stamp = |event: sys::cl_event, what: sys::cl_profiling_info| -> Result<u64, ClError> {
+            let mut value: sys::cl_ulong = 0;
+            // SAFETY: a completed event from a profiling queue; the out-param
+            // is a cl_ulong of the size passed.
+            check("clGetEventProfilingInfo", unsafe {
+                sys::clGetEventProfilingInfo(event, what, size_of::<sys::cl_ulong>(), (&raw mut value).cast(),
+                    ptr::null_mut())
+            })?;
+            Ok(value)
+        };
+        events
+            .0
+            .iter()
+            .map(|&e| {
+                let (start, end) = (stamp(e, sys::CL_PROFILING_COMMAND_START)?, stamp(e, sys::CL_PROFILING_COMMAND_END)?);
+                Ok(std::time::Duration::from_nanos(end.saturating_sub(start)))
+            })
+            .collect()
+    }
+}
+
+impl Drop for ProfilingQueue {
+    fn drop(&mut self) {
+        // SAFETY: owned queue.
+        unsafe { sys::clReleaseCommandQueue(self.0) };
+    }
+}
+
+/// Events owned until drop, so an early return cannot leak them.
+struct Events(Vec<sys::cl_event>);
+
+impl Drop for Events {
+    fn drop(&mut self) {
+        for &e in &self.0 {
+            // SAFETY: each event came from a successful enqueue and is released once.
+            unsafe { sys::clReleaseEvent(e) };
+        }
+    }
+}
+
 impl Drop for Context {
     fn drop(&mut self) {
         // SAFETY: owned handles created above.

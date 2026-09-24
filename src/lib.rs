@@ -59,6 +59,7 @@ pub enum Error {
 }
 
 struct Launch {
+    name: String,
     kernel: cl::Kernel,
     dim: u32,
     global: [usize; 3],
@@ -203,7 +204,7 @@ impl Replay {
                     Arg::Null => cl::Context::set_arg_null(&kernel, index)?,
                 }
             }
-            launches.push(Launch { kernel, dim: l.dim, global: l.global, local: l.local, offset: l.offset });
+            launches.push(Launch { name: l.name.clone(), kernel, dim: l.dim, global: l.global, local: l.local, offset: l.offset });
         }
 
         let resolve = |p: &plan::Port, output: bool| -> Result<Io, Error> {
@@ -259,6 +260,19 @@ impl Replay {
     pub fn set_input(&mut self, name: &str, data: &[u8]) -> Result<(), Error> {
         let input = self.inputs.iter().find(|i| i.name == name).ok_or_else(|| Error::NoInput(name.to_owned()))?;
         self.write(input, data)
+    }
+
+    /// Run once on a profiling queue and return each launch's kernel name
+    /// and GPU execution time, in launch order.
+    ///
+    /// # Errors
+    ///
+    /// An `OpenCL` failure creating the queue, enqueueing or reading the
+    /// profile.
+    pub fn profile(&mut self) -> Result<Vec<(String, std::time::Duration)>, Error> {
+        let queue = self.ctx.profiling_queue()?;
+        let times = queue.time(self.launches.iter().map(|l| (&l.kernel, l.dim, &l.global, &l.local, &l.offset)))?;
+        Ok(self.launches.iter().map(|l| l.name.clone()).zip(times).collect())
     }
 
     /// Run the recorded launches and wait for them.
