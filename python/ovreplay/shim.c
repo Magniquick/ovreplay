@@ -60,7 +60,8 @@ static void add_kern(cl_kernel k, cl_program p, const char *name) {
   Kern *K = &kn[nkn]; memset(K, 0, sizeof *K); K->k = k; K->id = nkn; K->prog = prog_idx(p); snprintf(K->name, sizeof K->name, "%s", name); nkn++;
 }
 static void dump_prog(int pi) {
-  if (pr[pi].dumped) return; pr[pi].dumped = 1;
+  if (pr[pi].dumped) return;
+  pr[pi].dumped = 1;
   REAL(clGetProgramInfo);
   size_t sz = 0; real_clGetProgramInfo(pr[pi].p, CL_PROGRAM_BINARY_SIZES, sizeof sz, &sz, NULL);
   unsigned char *b = malloc(sz); unsigned char *bp[1] = {b};
@@ -169,7 +170,8 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueNDRangeKernel(cl_command_queue q, cl_ke
       for (int i = 0; i < K->nargs; i++) { Arg *A = &K->args[i];
         switch (A->kind) { case 1: fprintf(lg, " M %d\n", A->alloc); break; case 2: fprintf(lg, " U %d %zu\n", A->alloc, A->off); break;
           case 4: fprintf(lg, " L %zu\n", A->size); break; case 5: fprintf(lg, " N\n"); break;
-          case 3: case 6: fprintf(lg, " V %zu", A->size); for (size_t j = 0; j < A->size && j < 64; j++) fprintf(lg, " %02x", A->val[j]); fprintf(lg, "\n"); break;
+          case 6: fprintf(lg, " X\n"); fprintf(lg, "UNSUPPORTED pointer arg %d of %s outside every tracked allocation\n", i, K->name); break;
+          case 3: fprintf(lg, " V %zu", A->size); for (size_t j = 0; j < A->size && j < 64; j++) fprintf(lg, " %02x", A->val[j]); fprintf(lg, "\n"); break;
           default: fprintf(lg, " X\n"); fprintf(lg, "UNSUPPORTED unset arg %d of %s\n", i, K->name); } } } }
   pthread_mutex_unlock(&mu); return real_clEnqueueNDRangeKernel(q, k, dim, go, gs, ls, ne, ev, oe); }
 CL_API_ENTRY cl_int CL_API_CALL clEnqueueWriteBuffer(cl_command_queue q, cl_mem b, cl_bool bl, size_t off, size_t n, const void *p, cl_uint ne, const cl_event *ev, cl_event *oe) {
@@ -184,7 +186,7 @@ CL_API_ENTRY void *CL_API_CALL clEnqueueMapBuffer(cl_command_queue q, cl_mem b, 
   REAL(clEnqueueMapBuffer); pthread_mutex_lock(&mu); if (recording) fprintf(lg, "UNSUPPORTED MAP %d %zu %zu flags %lu\n", find_mem(b), off, n, (unsigned long)f); pthread_mutex_unlock(&mu); return real_clEnqueueMapBuffer(q, b, bl, f, off, n, ne, ev, oe, e); }
 
 // ---- control, called from the host program via dlsym
-static cl_command_queue myq; static int snapb[16384]; static int snapn;
+static cl_command_queue myq; static int *snapb; static int snapn;
 void shim_start(const char *dir) {
   pthread_mutex_lock(&mu); outdir = strdup(dir); char fn[512]; snprintf(fn, sizeof fn, "%s/rec.txt", dir); lg = fopen(fn, "w");
   REAL(clCreateCommandQueueWithProperties); REAL(clEnqueueReadBuffer); REAL(clFinish);
@@ -195,7 +197,7 @@ void shim_start(const char *dir) {
     real_clGetDeviceInfo(gdev, CL_DRIVER_VERSION, sizeof v, v, NULL); fprintf(lg, "DRIVER_VERSION %s\n", v);
     cl_uint id = 0; if (real_clGetDeviceInfo(gdev, 0x4251 /* CL_DEVICE_ID_INTEL */, sizeof id, &id, NULL) == CL_SUCCESS) fprintf(lg, "DEVICE_ID %u\n", id); }
   cl_int qe = 0; myq = real_clCreateCommandQueueWithProperties(gctx, gdev, NULL, &qe);
-  for (int i = 0; i < 16384; i++) snapb[i] = -1; snapn = nal;
+  snapn = nal; snapb = malloc((nal ? nal : 1) * sizeof *snapb); for (int i = 0; i < nal; i++) snapb[i] = -1;
   // snapshot every live allocation
   for (int i = 0; i < nal; i++) if (al[i].live) {
     fprintf(lg, "ALLOC %d %d %zu %lu %d %zu\n", i, al[i].kind, al[i].size, (unsigned long)al[i].flags, al[i].parent, al[i].origin);
@@ -225,7 +227,7 @@ static const char *hooked[] = {"clGetExtensionFunctionAddressForPlatform","clGet
 static void *self_handle(void){ static void *h; if(!h){ Dl_info di; dladdr((void*)&self_handle, &di); h = dlopen(di.dli_fname, RTLD_NOW|RTLD_NOLOAD); } return h; }
 void *dlsym(void *h, const char *name) {
   void *r = real_dlsym_fn()(h, name);
-  if (name && name[0]==0x63 && name[1]==0x6c && (h == libcl() || h == RTLD_DEFAULT || h == RTLD_NEXT)) { for (int i = 0; hooked[i]; i++) if (!strcmp(hooked[i], name)) { void *mine = real_dlsym_fn()(self_handle(), name); if (mine && r) return mine; } 
+  if (name[0]==0x63 && name[1]==0x6c && (h == libcl() || h == RTLD_DEFAULT || h == RTLD_NEXT)) { for (int i = 0; hooked[i]; i++) if (!strcmp(hooked[i], name)) { void *mine = real_dlsym_fn()(self_handle(), name); if (mine && r) return mine; } 
     if (getenv("SHIM_VERBOSE") && r) fprintf(stderr, "shim: dlsym %s\n", name); }
   return r;
 }

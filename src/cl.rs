@@ -208,12 +208,14 @@ impl Context {
             sys::clCreateProgramWithBinary(self.ctx, 1, &raw const self.device, &raw mut len, &raw mut ptr_bin, &raw mut status, &raw mut err)
         };
         check("clCreateProgramWithBinary", err)?;
+        // Owned from here, so every early return releases it.
+        let program = Program(program);
         check("clCreateProgramWithBinary(status)", status)?;
         // SAFETY: valid program and device; no options, no callback.
         check("clBuildProgram", unsafe {
-            sys::clBuildProgram(program, 1, &raw const self.device, c"".as_ptr(), None, ptr::null_mut())
+            sys::clBuildProgram(program.0, 1, &raw const self.device, c"".as_ptr(), None, ptr::null_mut())
         })?;
-        Ok(Program(program))
+        Ok(program)
     }
 
     pub fn kernel(program: &Program, name: &str) -> Result<Kernel, ClError> {
