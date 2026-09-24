@@ -93,7 +93,7 @@ pub struct Replay {
     outputs: Vec<Io>,
     golden: PathBuf,
     _weights: cl::Alloc,
-    _scratch: Vec<cl::Alloc>,
+    _scratch: cl::Alloc,
     _host: Vec<cl::Alloc>,
     ctx: cl::Context,
 }
@@ -101,6 +101,11 @@ pub struct Replay {
 // SAFETY: every handle and pointer is owned by the Replay and used through
 // `&mut self`/`&self` from one thread at a time, which OpenCL allows.
 unsafe impl Send for Replay {}
+
+/// Alignment of each scratch allocation inside the arena. A page, which is
+/// more than any kernel asks of its buffers; the padding is at most a few
+/// hundred kilobytes over the whole recording.
+const SCRATCH_ALIGN: usize = 4096;
 
 fn describe(name: &str, id: Option<u32>, driver: &str) -> String {
     id.map_or_else(|| format!("{name} / {driver}"), |id| format!("{name} [{id:#06x}] / {driver}"))
@@ -186,11 +191,12 @@ impl Replay {
             }
             bind(w.id, Slot { ptr: weights.ptr().wrapping_byte_add(w.off), size: w.size, host: false })?;
         }
-        let mut scratch = Vec::with_capacity(plan.scratch.len());
-        for s in &plan.scratch {
-            let a = ctx.device_alloc(s.size)?;
-            bind(s.id, Slot { ptr: a.ptr(), size: s.size, host: false })?;
-            scratch.push(a);
+        // Scratch: one arena, with allocations that are never live at the
+        // same time sharing memory (see `Plan::scratch_layout`).
+        let (offsets, arena_size) = plan.scratch_layout(SCRATCH_ALIGN);
+        let arena = ctx.device_alloc(arena_size)?;
+        for (s, off) in plan.scratch.iter().zip(offsets) {
+            bind(s.id, Slot { ptr: arena.ptr().wrapping_byte_add(off), size: s.size, host: false })?;
         }
         let mut host = Vec::with_capacity(plan.host.len());
         for h in &plan.host {
@@ -246,7 +252,7 @@ impl Replay {
             outputs,
             golden: dir.join("golden.bin"),
             _weights: weights,
-            _scratch: scratch,
+            _scratch: arena,
             _host: host,
             ctx,
         })

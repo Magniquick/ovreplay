@@ -223,6 +223,74 @@ impl Plan {
         self.weights.iter().chain(&self.scratch).chain(&self.host).map(|r| r.id).max().unwrap_or(0)
     }
 
+    /// Where each scratch allocation lives inside one shared arena, and the
+    /// arena's size. Scratch allocations whose lifetimes do not overlap share
+    /// memory: an allocation is live from the first launch that uses it to
+    /// the last, and all of the run if it holds an input or an output. The
+    /// placement is greedy, largest first, each at the lowest aligned offset
+    /// that does not collide with an already placed allocation live at the
+    /// same time. Offsets are in the order of [`Plan::scratch`].
+    #[must_use]
+    pub fn scratch_layout(&self, align: usize) -> (Vec<usize>, usize) {
+        let align = align.max(1);
+        let index: HashMap<usize, usize> = self.scratch.iter().enumerate().map(|(i, r)| (r.id, i)).collect();
+        // Launch indices; inputs are written before launch 0 and outputs
+        // read after the last one.
+        let end = self.launches.len();
+        let mut live: Vec<Option<(usize, usize)>> = vec![None; self.scratch.len()];
+        let mut touch = |alloc: usize, at: (usize, usize)| {
+            if let Some(slot) = index.get(&alloc).and_then(|&i| live.get_mut(i)) {
+                *slot = Some(slot.map_or(at, |(a, b)| (a.min(at.0), b.max(at.1))));
+            }
+        };
+        for (i, launch) in self.launches.iter().enumerate() {
+            for arg in &launch.args {
+                if let Arg::Ptr { alloc, .. } = arg {
+                    touch(*alloc, (i, i));
+                }
+            }
+        }
+        for port in &self.inputs {
+            touch(port.alloc, (0, 0));
+        }
+        for port in &self.outputs {
+            touch(port.alloc, (end, end));
+        }
+
+        let round = |n: usize| n.div_ceil(align).saturating_mul(align);
+        let mut order: Vec<usize> = (0..self.scratch.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(self.scratch.get(i).map_or(0, |r| r.size)));
+        let mut offsets = vec![0; self.scratch.len()];
+        // (offset, size, lifetime) of every allocation placed so far.
+        let mut placed: Vec<(usize, usize, (usize, usize))> = Vec::new();
+        let mut total = 0usize;
+        for i in order {
+            let (Some(region), Some(Some(when))) = (self.scratch.get(i), live.get(i).copied()) else {
+                continue; // never used: offset 0 is as good as any
+            };
+            let size = round(region.size);
+            let mut clashes: Vec<(usize, usize)> = placed
+                .iter()
+                .filter(|p| p.2.0 <= when.1 && when.0 <= p.2.1)
+                .map(|p| (p.0, p.0.saturating_add(p.1)))
+                .collect();
+            clashes.sort_unstable();
+            let mut at = 0usize;
+            for (start, stop) in clashes {
+                if at.saturating_add(size) <= start {
+                    break;
+                }
+                at = at.max(stop);
+            }
+            if let Some(o) = offsets.get_mut(i) {
+                *o = at;
+            }
+            placed.push((at, size, when));
+            total = total.max(at.saturating_add(size));
+        }
+        (offsets, total)
+    }
+
     pub fn build_programs(&self, ctx: &cl::Context, dir: &Path) -> Result<HashMap<usize, cl::Program>, Error> {
         let mut out = HashMap::with_capacity(self.programs.len());
         for &p in &self.programs {
@@ -286,6 +354,59 @@ NDR 4 3 16 1 1 16 1 1 0 0 0 4
         assert!(Plan::parse(&SAMPLE.replace(" N\n", "")).is_err());
         assert!(Plan::parse(&SAMPLE.replace("NDR 4 3 ", "NDR 4 4 ")).is_err());
         assert!(Plan::parse(&SAMPLE.replace("NDR 4 3 ", "NDR 4 0 ")).is_err());
+    }
+
+    fn launch(allocs: &[usize]) -> LaunchPlan {
+        LaunchPlan {
+            program: 0,
+            name: "k".into(),
+            dim: 1,
+            global: [1, 1, 1],
+            local: [0, 0, 0],
+            offset: [0, 0, 0],
+            args: allocs.iter().map(|&alloc| Arg::Ptr { alloc, off: 0 }).collect(),
+        }
+    }
+
+    fn chain(sizes: &[usize], launches: Vec<LaunchPlan>) -> Plan {
+        let mut p = Plan::parse(SAMPLE).unwrap();
+        p.scratch = sizes.iter().enumerate().map(|(i, &size)| Region { id: 100 + i, off: 0, size }).collect();
+        p.inputs.clear();
+        p.outputs.clear();
+        p.launches = launches;
+        p
+    }
+
+    #[test]
+    fn scratch_that_is_never_live_together_shares_memory() {
+        // a -> b -> c: a and c are never live at the same time as each other
+        // once b has consumed a, so c can reuse a's memory.
+        let p = chain(&[1000, 500, 1000], vec![launch(&[100, 101]), launch(&[101, 102])]);
+        let (off, total) = p.scratch_layout(256);
+        assert_eq!(off[0], off[2], "{off:?}");
+        assert_ne!(off[1], off[0]);
+        assert_eq!(total, 1024 + 512);
+    }
+
+    #[test]
+    fn scratch_live_together_never_overlaps() {
+        let p = chain(&[300, 300, 300], vec![launch(&[100, 101, 102])]);
+        let (off, total) = p.scratch_layout(256);
+        let mut spans: Vec<(usize, usize)> = off.iter().map(|&o| (o, o + 512)).collect();
+        spans.sort_unstable();
+        assert!(spans.windows(2).all(|w| w[0].1 <= w[1].0), "{spans:?}");
+        assert_eq!(total, 3 * 512);
+    }
+
+    #[test]
+    fn inputs_and_outputs_live_for_the_whole_run() {
+        let mut p = chain(&[256, 256], vec![launch(&[100]), launch(&[101])]);
+        let (off, _) = p.scratch_layout(256);
+        assert_eq!(off[0], off[1], "disjoint lifetimes share");
+        let port = |alloc| Port { name: "x".into(), alloc, off: 0, bytes: 4, element_type: "f32".into(), golden: 0 };
+        p.outputs.push(port(100));
+        let (off, _) = p.scratch_layout(256);
+        assert_ne!(off[0], off[1], "an output stays live to the end");
     }
 
     #[test]
