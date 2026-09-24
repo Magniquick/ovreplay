@@ -143,12 +143,9 @@ impl Replay {
 
         // Constants: one device allocation, filled once from weights.bin.
         let path = dir.join("weights.bin");
-        let file = std::fs::File::open(&path).map_err(|source| Error::Io { path: path.clone(), source })?;
-        // SAFETY: read-only map of a file nothing else writes during load.
-        let bytes = unsafe { memmap2::Mmap::map(&file) }.map_err(|source| Error::Io { path, source })?;
+        let bytes = std::fs::read(&path).map_err(|source| Error::Io { path, source })?;
         let weights = ctx.device_alloc(bytes.len())?;
-        // SAFETY: `weights` holds bytes.len() bytes, and so does the map.
-        unsafe { ctx.copy(weights.ptr(), bytes.as_ptr().cast(), bytes.len())? };
+        ctx.upload(&weights, 0, &bytes)?;
         let weights_len = bytes.len();
         drop(bytes);
 

@@ -10,7 +10,6 @@ categories = ["science", "hardware-support"]
 exclude = ["python/", "pyproject.toml"]
 
 [dependencies]
-memmap2 = "0.9"
 opencl-sys = { version = "0.6", features = ["static", "CL_VERSION_1_2", "CL_VERSION_2_0", "cl_intel_unified_shared_memory"] }
 thiserror = "2"
 

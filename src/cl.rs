@@ -63,6 +63,7 @@ impl Usm {
 /// A USM allocation, freed on drop.
 pub struct Alloc {
     ptr: *mut c_void,
+    size: usize,
     ctx: sys::cl_context,
     free: sys::clMemBlockingFreeINTEL_t,
 }
@@ -153,7 +154,7 @@ impl Context {
         // SAFETY: valid context and device; 0 flags, default alignment.
         let ptr = unsafe { alloc(self.ctx, self.device, ptr::null(), size.max(1), 0, &raw mut err) };
         check("clDeviceMemAllocINTEL", err)?;
-        Ok(Alloc { ptr, ctx: self.ctx, free: self.usm.free })
+        Ok(Alloc { ptr, size, ctx: self.ctx, free: self.usm.free })
     }
 
     pub fn host_alloc(&self, size: usize) -> Result<Alloc, ClError> {
@@ -162,7 +163,21 @@ impl Context {
         // SAFETY: valid context; 0 flags, default alignment.
         let ptr = unsafe { alloc(self.ctx, ptr::null(), size.max(1), 0, &raw mut err) };
         check("clHostMemAllocINTEL", err)?;
-        Ok(Alloc { ptr, ctx: self.ctx, free: self.usm.free })
+        Ok(Alloc { ptr, size, ctx: self.ctx, free: self.usm.free })
+    }
+
+    /// Blocking copy of `data` into `dst` at byte offset `off`.
+    ///
+    /// # Errors
+    ///
+    /// `CL_INVALID_VALUE` if `data` does not fit, or the copy's own error.
+    pub fn upload(&self, dst: &Alloc, off: usize, data: &[u8]) -> Result<(), ClError> {
+        if off.checked_add(data.len()).is_none_or(|end| end > dst.size) {
+            return Err(ClError { call: "upload", code: sys::CL_INVALID_VALUE });
+        }
+        // SAFETY: `dst` owns `size` bytes and the range was just checked;
+        // `data` is a live slice of its own length.
+        unsafe { self.copy(dst.ptr.wrapping_byte_add(off), data.as_ptr().cast(), data.len()) }
     }
 
     /// Blocking USM copy `src` -> `dst` of `n` bytes.
