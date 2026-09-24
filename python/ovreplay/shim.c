@@ -225,12 +225,32 @@ void shim_stop(void) { pthread_mutex_lock(&mu); recording = 0; fprintf(lg, "STOP
 // The allocation holding host pointer `p` (an OpenVINO output tensor), or -1.
 int shim_locate(const void *p, size_t *off) { pthread_mutex_lock(&mu); int i = find_ptr(p, off); pthread_mutex_unlock(&mu); return i; }
 
-// oneDNN resolves OpenCL through dlopen+dlsym; route those names to our hooks.
-static const char *hooked[] = {"clGetExtensionFunctionAddressForPlatform","clGetExtensionFunctionAddress","clCreateContext","clCreateBuffer","clCreateSubBuffer","clCreateImage","clReleaseMemObject","clCreateProgramWithSource","clCreateProgramWithBinary","clCreateKernel","clCreateKernelsInProgram","clSetKernelArg","clEnqueueNDRangeKernel","clEnqueueWriteBuffer","clEnqueueReadBuffer","clEnqueueCopyBuffer","clEnqueueFillBuffer","clEnqueueMapBuffer","clCloneKernel","clCreateProgramWithIL","clLinkProgram","clCreateContextFromType",NULL};
+// oneDNN and the GPU plugin resolve OpenCL with dlopen("libOpenCL.so.1") and
+// dlsym on that handle, which LD_PRELOAD does not interpose; route those names
+// to our hooks. An explicit handle does not depend on the caller, so looking
+// it up from here is safe.
+//
+// Every other lookup must reach glibc as if the shim were not there:
+// RTLD_DEFAULT and RTLD_NEXT resolve relative to the calling object's scope.
+// IGC finds its embedded builtins and headers with dlsym(RTLD_DEFAULT,
+// "_igc_bif_BIFBC_..."), from libraries NEO loads RTLD_LOCAL; asked from the
+// shim, glibc searches the global scope, IGC gets NULL, and every build that
+// misses NEO's compiler cache fails (CL_BUILD_PROGRAM_FAILURE, or oneDNN
+// "could not create a primitive"). A guaranteed tail call keeps the caller's
+// return address, which is what glibc resolves against. cl* lookups through
+// RTLD_DEFAULT need no help: the preloaded shim is first in the global scope.
+#if !defined(__has_attribute) || !__has_attribute(musttail)
+#error "the dlsym hook needs __attribute__((musttail)) (GCC 15+, clang 13+)"
+#endif
+static const char *hooked[] = {"clGetExtensionFunctionAddressForPlatform","clGetExtensionFunctionAddress","clCreateContext","clCreateBuffer","clCreateSubBuffer","clCreateImage","clReleaseMemObject","clCreateProgramWithSource","clCreateProgramWithBinary","clCreateKernel","clCreateKernelsInProgram","clSetKernelArg","clEnqueueNDRangeKernel","clEnqueueWriteBuffer","clEnqueueReadBuffer","clEnqueueCopyBuffer","clEnqueueFillBuffer","clEnqueueMapBuffer",NULL};
 static void *self_handle(void){ static void *h; if(!h){ Dl_info di; dladdr((void*)&self_handle, &di); h = dlopen(di.dli_fname, RTLD_NOW|RTLD_NOLOAD); } return h; }
 void *dlsym(void *h, const char *name) {
-  void *r = real_dlsym_fn()(h, name);
-  if (name[0]==0x63 && name[1]==0x6c && (h == libcl() || h == RTLD_DEFAULT || h == RTLD_NEXT)) { for (int i = 0; hooked[i]; i++) if (!strcmp(hooked[i], name)) { void *mine = real_dlsym_fn()(self_handle(), name); if (mine && r) return mine; } 
-    if (getenv("SHIM_VERBOSE") && r) fprintf(stderr, "shim: dlsym %s\n", name); }
-  return r;
+  dlsym_t real = real_dlsym_fn();
+  if (name[0] == 'c' && name[1] == 'l' && h && h == libcl()) {
+    void *r = real(h, name);
+    for (int i = 0; r && hooked[i]; i++) if (!strcmp(hooked[i], name)) { void *mine = real(self_handle(), name); if (mine) return mine; }
+    if (getenv("SHIM_VERBOSE") && r) fprintf(stderr, "shim: dlsym %s passthrough\n", name);
+    return r;
+  }
+  __attribute__((musttail)) return real(h, name);
 }
