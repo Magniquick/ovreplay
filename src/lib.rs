@@ -120,6 +120,21 @@ impl Replay {
     /// format or `OpenCL` errors.
     pub fn load(dir: impl AsRef<Path>) -> Result<Self, Error> {
         let dir = dir.as_ref();
+        // Reading the weights needs no context and building the programs needs
+        // no weights, so the read runs on its own thread while this one sets
+        // up the device.
+        let path = dir.join("weights.bin");
+        std::thread::scope(|s| {
+            let read = s.spawn(|| std::fs::read(&path));
+            let weights = || match read.join() {
+                Ok(r) => r.map_err(|source| Error::Io { path: path.clone(), source }),
+                Err(_) => Err(Error::Io { path: path.clone(), source: std::io::Error::other("weights reader panicked") }),
+            };
+            Self::load_with(dir, weights)
+        })
+    }
+
+    fn load_with(dir: &Path, weights: impl FnOnce() -> Result<Vec<u8>, Error>) -> Result<Self, Error> {
         let plan = Plan::read(dir)?;
         let ctx = cl::Context::first_gpu()?;
         let name = ctx.device_string(CL_DEVICE_NAME)?;
@@ -132,19 +147,26 @@ impl Replay {
                 found: describe(&name, id, &driver),
             });
         }
-        let mut replay = Self::build(ctx, &plan, dir)?;
+        let mut replay = Self::build(ctx, &plan, dir, weights)?;
         if driver != plan.driver_version {
             replay.verify()?;
         }
         Ok(replay)
     }
 
-    fn build(ctx: cl::Context, plan: &Plan, dir: &Path) -> Result<Self, Error> {
+    fn build(
+        ctx: cl::Context,
+        plan: &Plan,
+        dir: &Path,
+        weights: impl FnOnce() -> Result<Vec<u8>, Error>,
+    ) -> Result<Self, Error> {
         let parse_err = |message: String| Error::Parse { path: dir.join("replay.txt"), message };
 
+        // Programs first, while the weights are still being read.
+        let programs = plan.build_programs(&ctx, dir)?;
+
         // Constants: one device allocation, filled once from weights.bin.
-        let path = dir.join("weights.bin");
-        let bytes = std::fs::read(&path).map_err(|source| Error::Io { path, source })?;
+        let bytes = weights()?;
         let weights = ctx.device_alloc(bytes.len())?;
         ctx.upload(&weights, 0, &bytes)?;
         let weights_len = bytes.len();
@@ -190,7 +212,6 @@ impl Replay {
             Ok((slot, slot.ptr.wrapping_byte_add(off)))
         };
 
-        let programs = plan.build_programs(&ctx, dir)?;
         let mut launches = Vec::with_capacity(plan.launches.len());
         for l in &plan.launches {
             let program = programs.get(&l.program).ok_or_else(|| parse_err(format!("no program {}", l.program)))?;
