@@ -1,0 +1,22 @@
+[package]
+name = "ovreplay"
+version = "0.1.0"
+edition = "2024"
+description = "Replay a recorded OpenVINO GPU inference over plain OpenCL: no graph compile, no oneDNN planning"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Magniquick/ovreplay"
+keywords = ["openvino", "opencl", "inference", "intel-gpu"]
+categories = ["science", "hardware-support"]
+exclude = ["python/", "pyproject.toml"]
+
+[dependencies]
+memmap2 = "0.9"
+opencl-sys = { version = "0.6", features = ["static", "CL_VERSION_1_2", "CL_VERSION_2_0", "cl_intel_unified_shared_memory"] }
+thiserror = "2"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[[example]]
+name = "ovreplay-run"
+path = "examples/run.rs"
