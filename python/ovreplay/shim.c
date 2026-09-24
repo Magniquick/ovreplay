@@ -23,12 +23,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 static pthread_mutex_t mu = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 static void *libcl(void){ static void *h; if(!h) h = dlopen("libOpenCL.so.1", RTLD_NOW|RTLD_GLOBAL); return h; }
 typedef void *(*dlsym_t)(void *, const char *);
-static dlsym_t real_dlsym_fn(void){ static dlsym_t f; if(!f) f = (dlsym_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34"); if(!f) f = (dlsym_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5"); return f; }
-#define REAL(name) static __typeof__(&name) real_##name; if (!real_##name) real_##name = real_dlsym_fn()(libcl(), #name)
+// Resolved lazily from whichever thread gets there first; the pointers are
+// atomic so concurrent first calls do not race (they resolve the same symbol).
+static dlsym_t real_dlsym_fn(void){ static _Atomic(dlsym_t) cache; dlsym_t f = atomic_load_explicit(&cache, memory_order_acquire); if(!f){ f = (dlsym_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34"); if(!f) f = (dlsym_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5"); atomic_store_explicit(&cache, f, memory_order_release); } return f; }
+#define REAL(name) static _Atomic(__typeof__(&name)) real_##name##_cache; __typeof__(&name) real_##name = atomic_load_explicit(&real_##name##_cache, memory_order_acquire); if (!real_##name) { real_##name = (__typeof__(&name))real_dlsym_fn()(libcl(), #name); atomic_store_explicit(&real_##name##_cache, real_##name, memory_order_release); }
 
 static const char *outdir = NULL; static FILE *lg = NULL; static int recording = 0;
 static cl_context gctx; static cl_device_id gdev;
